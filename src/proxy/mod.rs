@@ -159,8 +159,10 @@ pub async fn handle_chat_request(
     }
 
     // 2. Rate limit check (RPM)
+    // Bug fix #2: use scope-based rate limit key
+    let rate_limit_key = rate_limit_key_for_scope(&state.config.rate_limit.scope, api_key);
     if state.config.rate_limit.enabled {
-        let result = state.rate_limiter.check(api_key, 1);
+        let result = state.rate_limiter.check(&rate_limit_key, 1);
         if let RateLimitResult::Denied { retry_after } = result {
             return Err(GatewayError::RateLimited {
                 retry_after_ms: retry_after.as_millis() as u64,
@@ -170,16 +172,16 @@ pub async fn handle_chat_request(
 
     // 2a. Token-per-minute pre-check (TPM)
     if state.config.rate_limit.enabled {
-        // Estimate tokens from message content length (rough heuristic: 1 token ~ 4 chars)
+        // Bug fix #4: handle array-format content by iterating parts and summing text lengths
         let estimated_tokens: u64 = chat_request
             .messages
             .iter()
             .map(|m| {
-                let text = m.content.as_str().unwrap_or("");
-                (text.len() as u64) / 4 + 1
+                let char_count = estimate_content_chars(&m.content);
+                (char_count as u64) / 4 + 1
             })
             .sum();
-        let result = state.token_limiter.check(api_key, estimated_tokens);
+        let result = state.token_limiter.check(&rate_limit_key, estimated_tokens);
         if let RateLimitResult::Denied { retry_after } = result {
             return Err(GatewayError::RateLimited {
                 retry_after_ms: retry_after.as_millis() as u64,
@@ -283,16 +285,26 @@ pub async fn handle_chat_request(
         req = req.header(header, value);
     }
 
-    let upstream_response = req
-        .send()
-        .await
-        .map_err(|e| GatewayError::RequestError(e.to_string()))?;
+    let upstream_result = req.send().await;
+
+    let upstream_response = match upstream_result {
+        Ok(resp) => resp,
+        Err(e) => {
+            // Bug fix #1: record_failure on send error so in_flight is decremented
+            state.load_balancer.record_failure(&provider_name);
+            return Err(GatewayError::RequestError(e.to_string()));
+        }
+    };
 
     let status = upstream_response.status().as_u16();
-    let response_body = upstream_response
-        .text()
-        .await
-        .map_err(|e| GatewayError::RequestError(e.to_string()))?;
+    let response_body = match upstream_response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            // Bug fix #1: record_failure on body-read error so in_flight is decremented
+            state.load_balancer.record_failure(&provider_name);
+            return Err(GatewayError::RequestError(e.to_string()));
+        }
+    };
 
     let latency = start.elapsed();
 
@@ -359,6 +371,55 @@ pub async fn handle_chat_request(
         provider: provider_name,
         latency_ms: latency.as_millis() as u64,
     })
+}
+
+/// Compute the rate limit key based on the configured scope.
+///
+/// - `PerKey`: uses the API key directly (default behavior).
+/// - `Global`: uses a fixed key so all requests share one bucket.
+/// - `PerUser`: extracts a user identifier from the key (prefix before first `-`
+///   or the whole key), so user-level grouping works even with multiple keys.
+fn rate_limit_key_for_scope(scope: &crate::config::RateLimitScope, api_key: &str) -> String {
+    match scope {
+        crate::config::RateLimitScope::PerKey => api_key.to_string(),
+        crate::config::RateLimitScope::Global => "__global__".to_string(),
+        crate::config::RateLimitScope::PerUser => {
+            // Extract user prefix from key (e.g., "user123-sk-abc" -> "user123")
+            // If no separator, use the whole key.
+            api_key
+                .split_once('-')
+                .map(|(prefix, _)| format!("user:{}", prefix))
+                .unwrap_or_else(|| format!("user:{}", api_key))
+        }
+    }
+}
+
+/// Estimate character count from message content, handling both string and
+/// array-format content (multimodal messages).
+///
+/// Bug fix #4: array content was previously ignored because `as_str()` returns
+/// `None` for arrays, causing token estimation to be 0 and bypassing TPM limits.
+fn estimate_content_chars(content: &serde_json::Value) -> usize {
+    match content {
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(parts) => {
+            parts
+                .iter()
+                .map(|part| {
+                    // OpenAI multimodal format: [{"type": "text", "text": "..."}]
+                    if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        part.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        }
+        _ => content.to_string().len(),
+    }
 }
 
 /// Parse a model string like "openai/gpt-4o" into (Some("openai"), "gpt-4o").
@@ -446,9 +507,24 @@ pub struct GatewayStats {
     pub spend_by_key: std::collections::HashMap<String, f64>,
 }
 
+/// Mask an API key for safe display — show only last 4 chars.
+fn mask_api_key(key: &str) -> String {
+    if key.len() <= 4 {
+        "****".to_string()
+    } else {
+        format!("***{}", &key[key.len() - 4..])
+    }
+}
+
 /// Build stats response.
 pub fn gateway_stats(state: &Arc<GatewayState>) -> GatewayStats {
     let cache_stats = state.cache.stats();
+    // Bug fix #5: mask API keys in stats output to prevent key leakage
+    let raw_summary = state.spend_tracker.summary();
+    let masked_summary: std::collections::HashMap<String, f64> = raw_summary
+        .into_iter()
+        .map(|(key, spend)| (mask_api_key(&key), spend))
+        .collect();
     GatewayStats {
         cache_entries: cache_stats.entries,
         cache_capacity: cache_stats.capacity,
@@ -457,7 +533,7 @@ pub fn gateway_stats(state: &Arc<GatewayState>) -> GatewayStats {
         healthy_providers: state.load_balancer.healthy_count(),
         total_providers: state.load_balancer.total_count(),
         balance_strategy: state.load_balancer.strategy_name().to_string(),
-        spend_by_key: state.spend_tracker.summary(),
+        spend_by_key: masked_summary,
     }
 }
 
@@ -609,5 +685,119 @@ balance:
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"status\":200"));
         assert!(json.contains("\"cache_hit\":false"));
+    }
+
+    // --- Bug fix #2: rate limit scope key tests ---
+
+    #[test]
+    fn test_rate_limit_key_per_key() {
+        use crate::config::RateLimitScope;
+        let key = rate_limit_key_for_scope(&RateLimitScope::PerKey, "sk-test-123");
+        assert_eq!(key, "sk-test-123");
+    }
+
+    #[test]
+    fn test_rate_limit_key_global() {
+        use crate::config::RateLimitScope;
+        let key1 = rate_limit_key_for_scope(&RateLimitScope::Global, "sk-key-1");
+        let key2 = rate_limit_key_for_scope(&RateLimitScope::Global, "sk-key-2");
+        assert_eq!(key1, key2);
+        assert_eq!(key1, "__global__");
+    }
+
+    #[test]
+    fn test_rate_limit_key_per_user() {
+        use crate::config::RateLimitScope;
+        let key = rate_limit_key_for_scope(&RateLimitScope::PerUser, "user123-sk-abc");
+        assert_eq!(key, "user:user123");
+    }
+
+    #[test]
+    fn test_rate_limit_key_per_user_no_separator() {
+        use crate::config::RateLimitScope;
+        let key = rate_limit_key_for_scope(&RateLimitScope::PerUser, "simplekey");
+        assert_eq!(key, "user:simplekey");
+    }
+
+    // --- Bug fix #4: array content token estimation tests ---
+
+    #[test]
+    fn test_estimate_content_chars_string() {
+        let content = serde_json::json!("hello world");
+        assert_eq!(estimate_content_chars(&content), 11);
+    }
+
+    #[test]
+    fn test_estimate_content_chars_array() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+            {"type": "text", "text": " world"}
+        ]);
+        assert_eq!(estimate_content_chars(&content), 11); // "hello" + " world"
+    }
+
+    #[test]
+    fn test_estimate_content_chars_empty_array() {
+        let content = serde_json::json!([]);
+        assert_eq!(estimate_content_chars(&content), 0);
+    }
+
+    #[test]
+    fn test_estimate_content_chars_array_no_text_parts() {
+        let content = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+        ]);
+        assert_eq!(estimate_content_chars(&content), 0);
+    }
+
+    // --- Bug fix #5: API key masking tests ---
+
+    #[test]
+    fn test_mask_api_key_long() {
+        assert_eq!(mask_api_key("sk-test-secret-key-1234"), "***1234");
+    }
+
+    #[test]
+    fn test_mask_api_key_short() {
+        assert_eq!(mask_api_key("ab"), "****");
+    }
+
+    #[test]
+    fn test_mask_api_key_exactly_4() {
+        assert_eq!(mask_api_key("abcd"), "****");
+    }
+
+    #[test]
+    fn test_mask_api_key_5_chars() {
+        assert_eq!(mask_api_key("abcde"), "***bcde");
+    }
+
+    #[test]
+    fn test_stats_masks_keys() {
+        let config = crate::config::GatewayConfig::from_str(
+            r#"
+providers:
+  - name: openai
+    base_url: https://api.openai.com
+"#,
+        )
+        .unwrap();
+        let state = GatewayState::from_config(config);
+        // Record some spend with a real-looking API key
+        state.spend_tracker.record(
+            "sk-secret-api-key-12345678",
+            &crate::cost::RequestCost {
+                total_cost: 1.0,
+                model: "gpt-4o".to_string(),
+                ..Default::default()
+            },
+        );
+        let stats = gateway_stats(&state);
+        // The key in spend_by_key should be masked
+        for key in stats.spend_by_key.keys() {
+            assert!(!key.contains("sk-secret"), "API key should be masked in stats");
+            assert!(key.starts_with("***"), "Masked key should start with ***");
+        }
     }
 }

@@ -96,10 +96,6 @@ pub struct ProviderConfig {
     /// Whether this provider is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
-
-    /// Provider-specific rate limits.
-    #[serde(default)]
-    pub rate_limits: Option<ProviderRateLimit>,
 }
 
 impl ProviderConfig {
@@ -150,17 +146,6 @@ pub struct ModelConfig {
     /// Context window size.
     #[serde(default)]
     pub context_window: Option<u64>,
-}
-
-/// Provider-specific rate limits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderRateLimit {
-    /// Requests per minute.
-    #[serde(default)]
-    pub rpm: Option<u64>,
-    /// Tokens per minute.
-    #[serde(default)]
-    pub tpm: Option<u64>,
 }
 
 /// Cache configuration.
@@ -593,22 +578,6 @@ cost:
         let override_ = config.cost.pricing_overrides.get("custom-model").unwrap();
         assert_eq!(override_.input_cost_per_million, 1.0);
         assert_eq!(override_.output_cost_per_million, 2.0);
-    }
-
-    #[test]
-    fn test_provider_rate_limits() {
-        let yaml = r#"
-providers:
-  - name: openai
-    base_url: https://api.openai.com
-    rate_limits:
-      rpm: 10000
-      tpm: 2000000
-"#;
-        let config = GatewayConfig::from_str(yaml).unwrap();
-        let rl = config.providers[0].rate_limits.as_ref().unwrap();
-        assert_eq!(rl.rpm, Some(10000));
-        assert_eq!(rl.tpm, Some(2000000));
     }
 
     #[test]
