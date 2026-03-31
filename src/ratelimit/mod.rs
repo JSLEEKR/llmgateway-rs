@@ -325,6 +325,10 @@ impl BudgetTracker {
     }
 
     /// Check if spending `amount` would exceed the budget.
+    ///
+    /// Always records the spend (even when over budget) so the tracker
+    /// accurately reflects total cost incurred. Returns `Denied` when
+    /// the cumulative spend exceeds the daily limit.
     pub fn check(&self, key: &str, amount: f64) -> RateLimitResult {
         if self.daily_limit <= 0.0 {
             return RateLimitResult::Allowed { remaining: u64::MAX };
@@ -345,8 +349,12 @@ impl BudgetTracker {
             *last_reset = Instant::now();
         }
 
-        if *current + amount <= self.daily_limit {
-            *current += amount;
+        // Always record the spend so the tracker stays accurate.
+        // Previous behavior silently dropped costs that exceeded the limit,
+        // allowing users to bypass the budget with many small requests.
+        *current += amount;
+
+        if *current <= self.daily_limit {
             let remaining_dollars = self.daily_limit - *current;
             RateLimitResult::Allowed {
                 remaining: (remaining_dollars * 100.0) as u64, // cents
@@ -599,6 +607,29 @@ mod tests {
     fn test_budget_current_spend_unknown_key() {
         let tracker = BudgetTracker::new(10.0);
         assert_eq!(tracker.current_spend("unknown"), 0.0);
+    }
+
+    #[test]
+    fn test_budget_records_spend_even_when_over_limit() {
+        // Regression test: previously, spending that exceeded the budget
+        // was silently dropped, allowing users to bypass the budget with
+        // many small requests after hitting the limit.
+        let tracker = BudgetTracker::new(10.0);
+        tracker.check("user1", 8.0); // $8 spent, under limit
+        let result = tracker.check("user1", 5.0); // $13 total, over $10 limit
+        assert!(!result.is_allowed());
+        // The $5 should still be recorded (total = $13)
+        assert!(
+            (tracker.current_spend("user1") - 13.0).abs() < 0.001,
+            "spend must be recorded even when over budget, got {}",
+            tracker.current_spend("user1")
+        );
+        // Subsequent small request should also be denied
+        let result = tracker.check("user1", 0.01);
+        assert!(
+            !result.is_allowed(),
+            "must deny requests when budget is already exceeded"
+        );
     }
 
     #[test]
