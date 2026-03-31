@@ -60,9 +60,8 @@ impl Provider {
         match self {
             Provider::Anthropic => vec![
                 ("anthropic-version", "2023-06-01"),
-                ("content-type", "application/json"),
             ],
-            _ => vec![("content-type", "application/json")],
+            _ => vec![],
         }
     }
 }

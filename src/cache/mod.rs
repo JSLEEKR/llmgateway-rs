@@ -57,6 +57,10 @@ pub struct CacheKeyComponents {
     pub messages: serde_json::Value,
     /// Temperature parameter.
     pub temperature: Option<f64>,
+    /// Max tokens parameter.
+    pub max_tokens: Option<u64>,
+    /// Top-p (nucleus sampling) parameter.
+    pub top_p: Option<f64>,
     /// Seed parameter for deterministic outputs.
     pub seed: Option<u64>,
     /// Optional cache namespace.
@@ -85,6 +89,17 @@ pub fn compute_cache_key(components: &CacheKeyComponents, ignore_keys: &[String]
         canonical.insert(
             "temperature".to_string(),
             serde_json::json!(format!("{:.6}", temp)),
+        );
+    }
+
+    if let Some(max_tokens) = components.max_tokens {
+        canonical.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+    }
+
+    if let Some(top_p) = components.top_p {
+        canonical.insert(
+            "top_p".to_string(),
+            serde_json::json!(format!("{:.6}", top_p)),
         );
     }
 
@@ -291,6 +306,8 @@ mod tests {
             model: model.to_string(),
             messages: serde_json::json!([{"role": "user", "content": msg}]),
             temperature: Some(0.7),
+            max_tokens: None,
+            top_p: None,
             seed: None,
             cache_seed: None,
             extra_params: BTreeMap::new(),
@@ -370,6 +387,8 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: serde_json::json!({"a": 1, "b": 2}),
             temperature: None,
+            max_tokens: None,
+            top_p: None,
             seed: None,
             cache_seed: None,
             extra_params: BTreeMap::new(),
@@ -378,6 +397,8 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: serde_json::json!({"b": 2, "a": 1}),
             temperature: None,
+            max_tokens: None,
+            top_p: None,
             seed: None,
             cache_seed: None,
             extra_params: BTreeMap::new(),

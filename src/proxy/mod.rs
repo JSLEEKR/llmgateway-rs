@@ -150,9 +150,36 @@ pub async fn handle_chat_request(
     let chat_request: ChatRequest = serde_json::from_str(request_body)
         .map_err(|e| GatewayError::InvalidRequest(e.to_string()))?;
 
+    // 1b. Reject streaming requests — the gateway returns parsed JSON,
+    //     which is incompatible with SSE streaming responses.
+    if chat_request.stream == Some(true) {
+        return Err(GatewayError::InvalidRequest(
+            "streaming (stream:true) is not supported by the gateway; set stream to false or omit it".to_string(),
+        ));
+    }
+
     // 2. Rate limit check (RPM)
     if state.config.rate_limit.enabled {
         let result = state.rate_limiter.check(api_key, 1);
+        if let RateLimitResult::Denied { retry_after } = result {
+            return Err(GatewayError::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            });
+        }
+    }
+
+    // 2a. Token-per-minute pre-check (TPM)
+    if state.config.rate_limit.enabled {
+        // Estimate tokens from message content length (rough heuristic: 1 token ~ 4 chars)
+        let estimated_tokens: u64 = chat_request
+            .messages
+            .iter()
+            .map(|m| {
+                let text = m.content.as_str().unwrap_or("");
+                (text.len() as u64) / 4 + 1
+            })
+            .sum();
+        let result = state.token_limiter.check(api_key, estimated_tokens);
         if let RateLimitResult::Denied { retry_after } = result {
             return Err(GatewayError::RateLimited {
                 retry_after_ms: retry_after.as_millis() as u64,
@@ -292,11 +319,6 @@ pub async fn handle_chat_request(
         let cost = state.cost_calculator.calculate(model_id, &usage);
         state.spend_tracker.record(api_key, &cost);
 
-        // Token-per-minute tracking (post-request — record tokens used)
-        if state.config.rate_limit.enabled && usage.total_tokens > 0 {
-            state.token_limiter.check(api_key, usage.total_tokens);
-        }
-
         Some(cost)
     } else {
         None
@@ -355,6 +377,8 @@ fn build_cache_key(request: &ChatRequest, ignore_keys: &[String]) -> String {
         model: request.model.clone(),
         messages: serde_json::to_value(&request.messages).unwrap_or_default(),
         temperature: request.temperature,
+        max_tokens: request.max_tokens,
+        top_p: request.top_p,
         seed: request.seed,
         cache_seed: None,
         extra_params: request

@@ -369,13 +369,22 @@ impl BudgetTracker {
         }
     }
 
-    /// Get current spend for a key.
+    /// Get current spend for a key (resets if the interval has elapsed).
     pub fn current_spend(&self, key: &str) -> f64 {
-        self.spend
-            .read()
-            .ok()
-            .and_then(|s| s.get(key).map(|(amount, _)| *amount))
-            .unwrap_or(0.0)
+        let mut spend = match self.spend.write() {
+            Ok(s) => s,
+            Err(_) => return 0.0,
+        };
+        if let Some((amount, last_reset)) = spend.get_mut(key) {
+            // Reset if interval has passed, same as check() does
+            if last_reset.elapsed() > self.reset_interval {
+                *amount = 0.0;
+                *last_reset = Instant::now();
+            }
+            *amount
+        } else {
+            0.0
+        }
     }
 
     /// Get the daily limit.
