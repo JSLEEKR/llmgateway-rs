@@ -1,0 +1,76 @@
+# llmgateway-rs — Example Configuration
+#
+# Copy this file to config.yaml and customize for your environment.
+
+listen: "0.0.0.0:8080"
+
+# Upstream LLM Providers
+providers:
+  - name: openai
+    base_url: https://api.openai.com
+    api_key: ${OPENAI_API_KEY}
+    auth_method: bearer
+    weight: 100
+    models:
+      - id: gpt-4o
+        input_cost_per_million: 2.50
+        output_cost_per_million: 10.0
+        context_window: 128000
+      - id: gpt-4o-mini
+        input_cost_per_million: 0.15
+        output_cost_per_million: 0.60
+        context_window: 128000
+      - id: o3-mini
+        input_cost_per_million: 1.10
+        output_cost_per_million: 4.40
+        context_window: 200000
+
+  - name: anthropic
+    base_url: https://api.anthropic.com
+    api_key: ${ANTHROPIC_API_KEY}
+    auth_method: api_key
+    weight: 80
+    models:
+      - id: claude-3-5-sonnet
+        input_cost_per_million: 3.0
+        output_cost_per_million: 15.0
+        context_window: 200000
+      - id: claude-3-5-haiku
+        input_cost_per_million: 0.80
+        output_cost_per_million: 4.0
+        context_window: 200000
+
+  - name: google
+    base_url: https://generativelanguage.googleapis.com
+    api_key: ${GOOGLE_API_KEY}
+    auth_method: bearer
+    weight: 60
+    models:
+      - id: gemini-2.0-flash
+        input_cost_per_million: 0.10
+        output_cost_per_million: 0.40
+        context_window: 1048576
+
+# Cache Settings
+cache:
+  enabled: true
+  ttl_seconds: 86400          # 24 hours
+  max_entries: 10000
+  ignore_keys:
+    - stream                   # Don't differentiate stream/non-stream
+
+# Rate Limiting
+rate_limit:
+  enabled: true
+  requests_per_minute: 60     # Per API key
+  tokens_per_minute: 100000
+  max_spend_per_day: 50.0     # $50/day budget cap
+  scope: per_key
+
+# Load Balancing
+balance:
+  strategy: p2c               # round_robin, p2c, weighted, least_connections
+
+# Cost Tracking
+cost:
+  enabled: true
