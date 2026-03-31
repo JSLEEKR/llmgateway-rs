@@ -165,7 +165,7 @@ pub async fn handle_chat_request(
     // gate here so that keys that are already over budget cannot send new requests.
     if state.config.rate_limit.max_spend_per_day > 0.0 {
         let current = state.budget_tracker.current_spend(api_key);
-        if current > state.config.rate_limit.max_spend_per_day {
+        if current >= state.config.rate_limit.max_spend_per_day {
             return Err(GatewayError::BudgetExceeded);
         }
     }
@@ -188,6 +188,10 @@ pub async fn handle_chat_request(
                     RequestCost::default()
                 };
                 state.spend_tracker.record(api_key, &cost);
+                // Record cache hit cost in budget tracker too
+                if state.config.rate_limit.max_spend_per_day > 0.0 && cost.total_cost > 0.0 {
+                    state.budget_tracker.check(api_key, cost.total_cost);
+                }
                 Some(cost)
             } else {
                 None
@@ -293,17 +297,19 @@ pub async fn handle_chat_request(
             state.token_limiter.check(api_key, usage.total_tokens);
         }
 
-        // Budget check (post-request — record spend, warn if exceeded)
-        if state.config.rate_limit.max_spend_per_day > 0.0 {
-            state
-                .budget_tracker
-                .check(api_key, cost.total_cost);
-        }
-
         Some(cost)
     } else {
         None
     };
+
+    // Budget check (post-request — record spend, warn if exceeded)
+    // Runs regardless of cost.enabled so budget enforcement always works.
+    if state.config.rate_limit.max_spend_per_day > 0.0 {
+        let spend_amount = cost.as_ref().map(|c| c.total_cost).unwrap_or(0.0);
+        if spend_amount > 0.0 {
+            state.budget_tracker.check(api_key, spend_amount);
+        }
+    }
 
     // 9. Cache store
     if state.config.cache.enabled {
