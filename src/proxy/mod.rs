@@ -160,6 +160,16 @@ pub async fn handle_chat_request(
         }
     }
 
+    // 2b. Budget pre-check — deny if key has already exceeded daily spend limit.
+    // The budget tracker records actual spend post-request, but we must also
+    // gate here so that keys that are already over budget cannot send new requests.
+    if state.config.rate_limit.max_spend_per_day > 0.0 {
+        let current = state.budget_tracker.current_spend(api_key);
+        if current > state.config.rate_limit.max_spend_per_day {
+            return Err(GatewayError::BudgetExceeded);
+        }
+    }
+
     // 3. Cache check
     if state.config.cache.enabled {
         let cache_key = build_cache_key(&chat_request, &state.config.cache.ignore_keys);
